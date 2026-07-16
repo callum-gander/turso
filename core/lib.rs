@@ -349,6 +349,115 @@ impl EncryptionOpts {
     }
 }
 
+/// Options for opening a [`Database`]. This is the single configuration point
+/// for [`Database::open`] and [`Database::open_async`], which every other
+/// `open_*` variant funnels into.
+///
+/// Mirrors the `std::fs::OpenOptions` idiom: configure, then open.
+///
+/// ```ignore
+/// let db = OpenOptions::new()
+///     .flags(OpenFlags::ReadOnly)
+///     .open(io, "app.db")?;
+/// ```
+#[derive(Clone)]
+pub struct OpenOptions {
+    /// Pre-opened database storage. When absent, `Database::open` opens the
+    /// file at the database path via the provided IO (requires the `fs`
+    /// feature); `Database::open_async` requires it to be set.
+    storage: Option<Arc<dyn DatabaseStorage>>,
+    /// WAL file path override. Defaults to `"{path}-wal"`.
+    wal_path: Option<String>,
+    flags: OpenFlags,
+    db_opts: DatabaseOpts,
+    encryption: Option<EncryptionOpts>,
+    durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+    allocator: alloc::DynAllocator,
+    /// SQL dialect the database is opened with. The dialect is fixed at open
+    /// time and shared by every user of the registered instance; a registry
+    /// hit with a different dialect is an error.
+    dialect: Arc<dyn Dialect>,
+    /// Skip the process-wide database registry. Used by the sync engine and
+    /// tests that intentionally create several Database instances for one file.
+    bypass_registry: bool,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            storage: None,
+            wal_path: None,
+            flags: OpenFlags::default(),
+            db_opts: DatabaseOpts::default(),
+            encryption: None,
+            durable_storage: None,
+            allocator: alloc::DynAllocator::default(),
+            dialect: Arc::new(SqliteDialect),
+            bypass_registry: false,
+        }
+    }
+}
+
+impl OpenOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn storage(mut self, storage: Arc<dyn DatabaseStorage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    pub fn wal_path(mut self, wal_path: impl Into<String>) -> Self {
+        self.wal_path = Some(wal_path.into());
+        self
+    }
+
+    pub fn flags(mut self, flags: OpenFlags) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    pub fn db_opts(mut self, db_opts: DatabaseOpts) -> Self {
+        self.db_opts = db_opts;
+        self
+    }
+
+    pub fn encryption(mut self, encryption: impl Into<Option<EncryptionOpts>>) -> Self {
+        self.encryption = encryption.into();
+        self
+    }
+
+    pub fn durable_storage(
+        mut self,
+        durable_storage: impl Into<Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>>,
+    ) -> Self {
+        self.durable_storage = durable_storage.into();
+        self
+    }
+
+    pub fn allocator(mut self, allocator: alloc::DynAllocator) -> Self {
+        self.allocator = allocator;
+        self
+    }
+
+    /// SQL dialect to open the database with. Defaults to [`SqliteDialect`].
+    pub fn dialect(mut self, dialect: Arc<dyn Dialect>) -> Self {
+        self.dialect = dialect;
+        self
+    }
+
+    pub fn bypass_registry(mut self) -> Self {
+        self.bypass_registry = true;
+        self
+    }
+
+    /// Open the database with these options; convenience for [`Database::open`].
+    pub fn open(self, io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
+        Database::open(io, path, self)
+    }
+}
+
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
 
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
@@ -1045,17 +1154,41 @@ impl Database {
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
         dialect: Arc<dyn Dialect>,
     ) -> Result<Arc<Database>> {
-        // Check the registry before opening the file to avoid acquiring a file
-        // lock that would conflict with an already-open Database in this process.
-        if let Some(db) = Self::lookup_in_registry(path, &encryption_opts, dialect.as_ref())? {
-            if durable_storage.is_some() && db.durable_storage.is_none() {
+        Self::open(
+            io,
+            path,
+            OpenOptions::new()
+                .flags(flags)
+                .db_opts(opts)
+                .encryption(encryption_opts)
+                .durable_storage(durable_storage)
+                .dialect(dialect),
+        )
+    }
+
+    /// Resolve `OpenOptions` that carry no explicit storage: check the
+    /// registry before opening the file to avoid acquiring a file lock that
+    /// would conflict with an already-open Database in this process, then open
+    /// the database file at `path` via the IO. Returns the registered Database
+    /// if one already exists, otherwise fills in `options.storage` (and the
+    /// effective flags) in place.
+    #[cfg(feature = "fs")]
+    fn resolve_default_storage(
+        io: &Arc<dyn IO>,
+        path: &str,
+        options: &mut OpenOptions,
+    ) -> Result<Option<Arc<Database>>> {
+        if let Some(db) =
+            Self::lookup_in_registry(path, &options.encryption, options.dialect.as_ref())?
+        {
+            if options.durable_storage.is_some() && db.durable_storage.is_none() {
                 return Err(LimboError::InvalidArgument(
                     "database already open without custom durable storage; \
                      close the existing instance before reopening with a custom DurableStorage"
                         .to_string(),
                 ));
             }
-            return Ok(db);
+            return Ok(Some(db));
         }
         // Mixed legacy/multiprocess opens are incompatible, but the two modes
         // advertise themselves through different lock domains (`.tshm` vs DB
@@ -1063,46 +1196,116 @@ impl Database {
         // open to narrow the TOCTOU window:
         //
         // 1. legacy open rejects an already-live multiprocess authority
-        Self::reject_live_multiprocess_wal_for_legacy_open(&io, path, opts)?;
-        let effective_flags = Self::effective_open_flags_for_path(&io, path, flags, opts)?;
+        Self::reject_live_multiprocess_wal_for_legacy_open(io, path, options.db_opts)?;
+        let effective_flags =
+            Self::effective_open_flags_for_path(io, path, options.flags, options.db_opts)?;
 
         // 2. multiprocess open rejects an already-live legacy DB-file lock
-        Self::reject_live_legacy_wal_for_multiprocess_open(&io, path, flags, opts)?;
+        Self::reject_live_legacy_wal_for_multiprocess_open(
+            io,
+            path,
+            options.flags,
+            options.db_opts,
+        )?;
         let file = io.open_file(path, effective_flags, true)?;
 
         // 3. legacy open re-checks after `open_file()` in case a multiprocess
         //    authority appeared between the initial probe and the actual open
-        Self::reject_live_multiprocess_wal_for_legacy_open(&io, path, opts)?;
-        let db_file = Arc::new(DatabaseFile::new(file));
-        Self::open_with_flags_with_allocator(
-            io,
-            path,
-            db_file,
-            effective_flags,
-            opts,
-            encryption_opts,
-            durable_storage,
-            alloc::DynAllocator::default(),
-            dialect,
-        )
+        Self::reject_live_multiprocess_wal_for_legacy_open(io, path, options.db_opts)?;
+        options.flags = effective_flags;
+        options.storage = Some(Arc::new(DatabaseFile::new(file)));
+        Ok(None)
     }
 
-    pub fn open(
+    #[cfg(not(feature = "fs"))]
+    fn resolve_default_storage(
+        _io: &Arc<dyn IO>,
+        _path: &str,
+        _options: &mut OpenOptions,
+    ) -> Result<Option<Arc<Database>>> {
+        Err(LimboError::InvalidArgument(
+            "OpenOptions::storage is required to open a database without the `fs` feature"
+                .to_string(),
+        ))
+    }
+
+    /// Open a database with the given [`OpenOptions`].
+    ///
+    /// This is the single entry point that every other `open_*` variant
+    /// funnels into; it drives the IO loop internally. Callers that need to
+    /// drive the IO loop themselves use [`Database::open_async`].
+    pub fn open(io: Arc<dyn IO>, path: &str, mut options: OpenOptions) -> Result<Arc<Database>> {
+        if options.storage.is_none() {
+            if let Some(db) = Self::resolve_default_storage(&io, path, &mut options)? {
+                return Ok(db);
+            }
+        }
+        let mut state = OpenDbAsyncState::new();
+        loop {
+            match Self::open_async(&mut state, io.clone(), path, &options)? {
+                IOResult::Done(db) => return Ok(db),
+                IOResult::IO(io_completion) => {
+                    io_completion.wait(&*io)?;
+                }
+            }
+        }
+    }
+
+    /// Async (IOResult-driven) twin of [`Database::open`]: the caller drives
+    /// the IO loop and passes `state` between calls. `OpenOptions::storage`
+    /// must be set.
+    ///
+    /// This matters for the sync-engine, which needs to yield on IO when the
+    /// schema table spans multiple pages (potentially network IO is needed to
+    /// load them).
+    pub fn open_async(
+        state: &mut OpenDbAsyncState,
         io: Arc<dyn IO>,
         path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
-        dialect: Arc<dyn Dialect>,
-    ) -> Result<Arc<Database>> {
-        Self::open_with_flags(
-            io,
-            path,
-            db_file,
-            OpenFlags::default(),
-            DatabaseOpts::new(),
-            None,
-            None,
-            dialect,
-        )
+        options: &OpenOptions,
+    ) -> Result<IOResult<Arc<Database>>> {
+        let Some(storage) = options.storage.clone() else {
+            return Err(LimboError::InvalidArgument(
+                "OpenOptions::storage is required for Database::open_async".to_string(),
+            ));
+        };
+        if options.bypass_registry {
+            Self::open_with_flags_bypass_registry_async_with_allocator(
+                state,
+                io,
+                path,
+                options.wal_path.as_deref(),
+                storage,
+                options.flags,
+                options.db_opts,
+                options.encryption.clone(),
+                options.durable_storage.clone(),
+                options.allocator.clone(),
+                options.dialect.clone(),
+            )
+        } else {
+            let result = Self::open_with_flags_async_internal(
+                state,
+                io,
+                path,
+                options.wal_path.as_deref(),
+                storage,
+                options.flags,
+                options.db_opts,
+                options.encryption.clone(),
+                options.durable_storage.clone(),
+                options.allocator.clone(),
+                options.dialect.clone(),
+            );
+            if result.is_err() {
+                // On error, remove the Opening sentinel so other callers can proceed.
+                if let Some(registry_key) = state.registry_key.take() {
+                    let mut registry = DATABASE_MANAGER.lock();
+                    registry.remove(&registry_key);
+                }
+            }
+            result
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1116,16 +1319,16 @@ impl Database {
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
         dialect: Arc<dyn Dialect>,
     ) -> Result<Arc<Database>> {
-        Self::open_with_flags_with_allocator(
+        Self::open(
             io,
             path,
-            db_file,
-            flags,
-            opts,
-            encryption_opts,
-            durable_storage,
-            alloc::DynAllocator::default(),
-            dialect,
+            OpenOptions::new()
+                .storage(db_file)
+                .flags(flags)
+                .db_opts(opts)
+                .encryption(encryption_opts)
+                .durable_storage(durable_storage)
+                .dialect(dialect),
         )
     }
 
@@ -1141,26 +1344,18 @@ impl Database {
         allocator: alloc::DynAllocator,
         dialect: Arc<dyn Dialect>,
     ) -> Result<Arc<Database>> {
-        let mut state = OpenDbAsyncState::new();
-        loop {
-            match Self::open_with_flags_async_with_allocator(
-                &mut state,
-                io.clone(),
-                path,
-                db_file.clone(),
-                flags,
-                opts,
-                encryption_opts.clone(),
-                durable_storage.clone(),
-                allocator.clone(),
-                dialect.clone(),
-            )? {
-                IOResult::Done(db) => return Ok(db),
-                IOResult::IO(io_completion) => {
-                    io_completion.wait(&*io)?;
-                }
-            }
-        }
+        Self::open(
+            io,
+            path,
+            OpenOptions::new()
+                .storage(db_file)
+                .flags(flags)
+                .db_opts(opts)
+                .encryption(encryption_opts)
+                .durable_storage(durable_storage)
+                .allocator(allocator)
+                .dialect(dialect),
+        )
     }
 
     /// async flow of opening the database
@@ -1188,17 +1383,17 @@ impl Database {
         // WAL file with NoLock or the second process fails to lock `-wal`.
         #[cfg(feature = "fs")]
         let flags = Self::effective_open_flags_for_path(&io, path, flags, opts)?;
-        Self::open_with_flags_async_with_allocator(
+        Self::open_async(
             state,
             io,
             path,
-            db_file,
-            flags,
-            opts,
-            encryption_opts,
-            durable_storage,
-            alloc::DynAllocator::default(),
-            dialect,
+            &OpenOptions::new()
+                .storage(db_file)
+                .flags(flags)
+                .db_opts(opts)
+                .encryption(encryption_opts)
+                .durable_storage(durable_storage)
+                .dialect(dialect),
         )
     }
 
@@ -1215,26 +1410,19 @@ impl Database {
         allocator: alloc::DynAllocator,
         dialect: Arc<dyn Dialect>,
     ) -> Result<IOResult<Arc<Database>>> {
-        let result = Self::open_with_flags_async_internal(
+        Self::open_async(
             state,
             io,
             path,
-            db_file,
-            flags,
-            opts,
-            encryption_opts,
-            durable_storage,
-            allocator,
-            dialect,
-        );
-        if result.is_err() {
-            // On error, remove the Opening sentinel so other callers can proceed.
-            if let Some(registry_key) = state.registry_key.take() {
-                let mut registry = DATABASE_MANAGER.lock();
-                registry.remove(&registry_key);
-            }
-        }
-        result
+            &OpenOptions::new()
+                .storage(db_file)
+                .flags(flags)
+                .db_opts(opts)
+                .encryption(encryption_opts)
+                .durable_storage(durable_storage)
+                .allocator(allocator)
+                .dialect(dialect),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1242,6 +1430,7 @@ impl Database {
         state: &mut OpenDbAsyncState,
         io: Arc<dyn IO>,
         path: &str,
+        wal_path: Option<&str>,
         db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         opts: DatabaseOpts,
@@ -1304,7 +1493,7 @@ impl Database {
             state,
             io.clone(),
             path,
-            None,
+            wal_path,
             db_file,
             flags,
             opts,
@@ -1371,26 +1560,18 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         dialect: Arc<dyn Dialect>,
     ) -> Result<Arc<Database>> {
-        let mut state = OpenDbAsyncState::new();
-        loop {
-            match Self::open_with_flags_bypass_registry_async(
-                &mut state,
-                io.clone(),
-                path,
-                Some(wal_path),
-                db_file.clone(),
-                flags,
-                opts,
-                encryption_opts.clone(),
-                None,
-                dialect.clone(),
-            )? {
-                IOResult::Done(db) => return Ok(db),
-                IOResult::IO(io_completion) => {
-                    io_completion.wait(&*io)?;
-                }
-            }
-        }
+        Self::open(
+            io,
+            path,
+            OpenOptions::new()
+                .storage(db_file)
+                .wal_path(wal_path)
+                .flags(flags)
+                .db_opts(opts)
+                .encryption(encryption_opts)
+                .dialect(dialect)
+                .bypass_registry(),
+        )
     }
 
     /// Async version of database opening that returns IOResult.
@@ -1409,25 +1590,18 @@ impl Database {
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
         dialect: Arc<dyn Dialect>,
     ) -> Result<IOResult<Arc<Database>>> {
-        let result = Self::open_with_flags_bypass_registry_async_internal(
-            state,
-            io,
-            path,
-            wal_path,
-            db_file,
-            flags,
-            opts,
-            encryption_opts,
-            durable_storage,
-            alloc::DynAllocator::default(),
-            dialect,
-        );
-        if result.is_err() {
-            // schema_guard is set by the open_with_flags_bypass_registry_async_internal - so we release it in case of error
-            // registry_guard is not managed by this function - so we don't touch it here and reset in the appropriate place
-            let _ = state.schema_guard.take();
+        let mut options = OpenOptions::new()
+            .storage(db_file)
+            .flags(flags)
+            .db_opts(opts)
+            .encryption(encryption_opts)
+            .durable_storage(durable_storage)
+            .dialect(dialect)
+            .bypass_registry();
+        if let Some(wal_path) = wal_path {
+            options = options.wal_path(wal_path);
         }
-        result
+        Self::open_async(state, io, path, &options)
     }
 
     #[allow(clippy::too_many_arguments)]
