@@ -444,6 +444,14 @@ impl Database {
         Ok(conn.clone())
     }
 
+    /// Cairn addition: hand the shared `turso_core::Connection` to Cairn's co-located
+    /// DB-replication layer, so a primary serves pulls (WAL frames) and applies pushes on the *same*
+    /// engine the app uses — no second copy. Rust-only (not `#[napi]`); consumed by the `cairn`
+    /// crate, never JS.
+    pub fn shared_connection(&self) -> Result<Arc<turso_core::Connection>> {
+        self.conn()
+    }
+
     /// Returns whether the database is in readonly-only mode.
     #[napi(getter)]
     pub fn readonly(&self) -> napi::Result<bool> {

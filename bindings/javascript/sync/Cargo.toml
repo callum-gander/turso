@@ -10,7 +10,9 @@ repository.workspace = true
 workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+# Cairn: `lib` (rlib) added so the `cairn` crate can depend on this binding as a library, not only
+# load it as a cdylib addon.
+crate-type = ["cdylib", "lib"]
 
 [dependencies]
 napi = { version = "3.8.3", default-features = false, features = ["napi6"] }

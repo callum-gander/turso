@@ -14,7 +14,9 @@ workspace = true
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-turso_core = { workspace = true, features = ["fts"] }
+# Cairn: `conn_raw_api` gates the WAL-frame API (wal_state/wal_get_frame) a primary needs to serve
+# pulls on the same connection the app uses. See `shared_connection()` below.
+turso_core = { workspace = true, features = ["fts", "conn_raw_api"] }
 turso_parser = { workspace = true }
 napi = { version = "3.8.3", default-features = false, features = ["napi6"] }
 napi-derive = { version = "3.5.2", default-features = true }
